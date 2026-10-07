@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     SRCCOPY, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TA_CENTER, TA_LEFT, TA_RIGHT,
     TA_TOP, TEXT_ALIGN_OPTIONS, TRANSPARENT, TextOutW,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, IsWindowVisible,
     RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowPos, ShowWindow,
@@ -351,6 +351,18 @@ pub fn capture_image(
 
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// true when running under Wine (ntdll exports wine_get_version)
+fn running_under_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| unsafe {
+        let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+        match GetModuleHandleW(PCWSTR(name.as_ptr())) {
+            Ok(ntdll) => GetProcAddress(ntdll, windows::core::s!("wine_get_version")).is_some(),
+            Err(_) => false,
+        }
+    })
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -529,14 +541,19 @@ impl GdiOverlay {
             draw_fn(back_dc, w as f32, h as f32);
 
             // gdi leaves alpha undefined, so rebuild it from the color key:
-            // pure black -> fully transparent, anything else -> opaque.
-            // (0 or 255 alpha keeps the pixels validly premultiplied.)
+            // pure black -> transparent, anything else -> opaque.
+            // under Wine "transparent" is alpha 1 instead of 0: Wine shapes
+            // ARGB windows (X Shape) to their alpha>0 pixels, and XWayland
+            // draws everything outside a window shape as solid black. alpha 1
+            // keeps the shape full-size so no shaping happens; 1/255 is
+            // invisible. (both values keep the pixels validly premultiplied.)
             let _ = GdiFlush();
             if !self.back_bits.is_null() {
+                let clear: u32 = if running_under_wine() { 0x0100_0000 } else { 0 };
                 let pixels =
                     std::slice::from_raw_parts_mut(self.back_bits, (w as usize) * (h as usize));
                 for px in pixels.iter_mut() {
-                    *px = if *px & 0x00FF_FFFF == 0 { 0 } else { *px | 0xFF00_0000 };
+                    *px = if *px & 0x00FF_FFFF == 0 { clear } else { *px | 0xFF00_0000 };
                 }
             }
 
