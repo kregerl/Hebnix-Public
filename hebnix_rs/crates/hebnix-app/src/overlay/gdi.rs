@@ -8,12 +8,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, AlphaBlend, BI_RGB, BITMAPINFO,
     BITMAPINFOHEADER, BLACK_BRUSH, BLENDFUNCTION, BitBlt, CLIP_DEFAULT_PRECIS,
-    CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, Ellipse, FillRect,
+    GdiFlush,
     GetDC, GetStockObject, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, HPEN, LineTo, MoveToEx,
     NULL_BRUSH, NULL_PEN, OUT_DEFAULT_PRECIS, PS_SOLID, Polygon, Rectangle, ReleaseDC, RoundRect,
     SRCCOPY, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TA_CENTER, TA_LEFT, TA_RIGHT,
@@ -21,9 +22,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, IsWindowVisible, LWA_COLORKEY,
-    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetLayeredWindowAttributes,
-    SetWindowPos, ShowWindow, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, IsWindowVisible,
+    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowPos, ShowWindow,
+    ULW_ALPHA, UpdateLayeredWindow, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
@@ -365,6 +366,8 @@ pub struct GdiOverlay {
     last_rect: Option<(i32, i32, i32, i32)>,
     back_dc: Option<HDC>,
     back_bmp: Option<HBITMAP>,
+    /// pixels of the 32bpp top-down back buffer (owned by back_bmp)
+    back_bits: *mut u32,
     back_old: HGDIOBJ,
     back_w: i32,
     back_h: i32,
@@ -377,6 +380,7 @@ impl GdiOverlay {
             last_rect: None,
             back_dc: None,
             back_bmp: None,
+            back_bits: std::ptr::null_mut(),
             back_old: HGDIOBJ(std::ptr::null_mut()),
             back_w: 0,
             back_h: 0,
@@ -419,8 +423,11 @@ impl GdiOverlay {
                 None,
             );
             if let Ok(hwnd) = hwnd {
-                // Pure black becomes transparent (color-key), like Python.
-                let _ = SetLayeredWindowAttributes(hwnd, rgb(Rgba(0, 0, 0, 255)), 0, LWA_COLORKEY);
+                // pure black is still the transparent "key", but it is turned
+                // into per-pixel alpha in frame() and pushed with
+                // UpdateLayeredWindow. a LWA_COLORKEY window needs X11 window
+                // shaping under Wine, which XWayland does not honour (solid
+                // black overlay); per-pixel alpha uses an ARGB visual instead.
                 super::register_hwnd(hwnd);
                 self.hwnd = Some(hwnd);
             }
@@ -434,10 +441,36 @@ impl GdiOverlay {
         unsafe {
             self.free_backbuffer();
             let dc = CreateCompatibleDC(Some(ref_dc));
-            let bmp = CreateCompatibleBitmap(ref_dc, w, h);
+            // 32bpp top-down DIB so the alpha channel can be written directly
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bmp = match CreateDIBSection(Some(ref_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(bmp) if !bits.is_null() => bmp,
+                Ok(bmp) => {
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    let _ = DeleteDC(dc);
+                    return;
+                }
+                Err(_) => {
+                    let _ = DeleteDC(dc);
+                    return;
+                }
+            };
             let old = SelectObject(dc, HGDIOBJ(bmp.0));
             self.back_dc = Some(dc);
             self.back_bmp = Some(bmp);
+            self.back_bits = bits as *mut u32;
             self.back_old = old;
             self.back_w = w;
             self.back_h = h;
@@ -454,6 +487,7 @@ impl GdiOverlay {
                 let _ = DeleteDC(dc);
             }
         }
+        self.back_bits = std::ptr::null_mut();
         self.back_w = 0;
         self.back_h = 0;
     }
@@ -494,8 +528,44 @@ impl GdiOverlay {
 
             draw_fn(back_dc, w as f32, h as f32);
 
-            // Composite onto the layered window.
-            let _ = BitBlt(win_dc, 0, 0, w, h, Some(back_dc), 0, 0, SRCCOPY);
+            // gdi leaves alpha undefined, so rebuild it from the color key:
+            // pure black -> fully transparent, anything else -> opaque.
+            // (0 or 255 alpha keeps the pixels validly premultiplied.)
+            let _ = GdiFlush();
+            if !self.back_bits.is_null() {
+                let pixels =
+                    std::slice::from_raw_parts_mut(self.back_bits, (w as usize) * (h as usize));
+                for px in pixels.iter_mut() {
+                    *px = if *px & 0x00FF_FFFF == 0 { 0 } else { *px | 0xFF00_0000 };
+                }
+            }
+
+            // push the frame with per-pixel alpha onto the layered window
+            let dst = POINT { x: left, y: top };
+            let size = SIZE { cx: w, cy: h };
+            let src = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            if UpdateLayeredWindow(
+                hwnd,
+                None, // screen dc
+                Some(&dst),
+                Some(&size),
+                Some(back_dc),
+                Some(&src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            )
+            .is_err()
+            {
+                // last resort, still draws something on odd drivers
+                let _ = BitBlt(win_dc, 0, 0, w, h, Some(back_dc), 0, 0, SRCCOPY);
+            }
             ReleaseDC(Some(hwnd), win_dc);
 
             // Real state, not a cached bool, the monitor thread may have
