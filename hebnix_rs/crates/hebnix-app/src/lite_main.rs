@@ -97,7 +97,10 @@ fn dcomp_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     use eframe::wgpu;
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup {
-        setup.instance_descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12);
+        // linux/wine patch: honour WGPU_BACKEND (e.g. "vulkan") when set,
+        // otherwise keep the upstream DX12 default
+        setup.instance_descriptor.backends =
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12);
         // `Auto` may pick up an unrelated dxcompiler.dll from PATH without the
         // matching dxil.dll, making wgpu's first internal shader fail and lose
         // the device. FXC is provided by Windows and needs no bundled DLLs.
@@ -110,6 +113,8 @@ fn dcomp_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
             .instance_descriptor
             .backend_options
             .dx12
+            // linux/wine patch: plain HWND swapchain, Wine has no working
+            // DirectComposition so DxgiFromVisual cannot present there
             .presentation_system = wgpu::Dx12SwapchainKind::DxgiFromHwnd;
     }
     options
