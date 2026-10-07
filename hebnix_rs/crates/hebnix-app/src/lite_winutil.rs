@@ -12,9 +12,9 @@ use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongW, GetWindowThreadProcessId,
     HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow, LWA_ALPHA, SW_RESTORE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetWindowLongW, SetWindowPos, ShowWindow, SwitchToThisWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, SwitchToThisWindow,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::PCWSTR;
 
@@ -50,6 +50,45 @@ pub fn focus_existing_instance() {
 
 pub fn main_window_hwnd() -> Option<HWND> {
     main_window()
+}
+
+/// linux/wine patch: Wine maps captionless popups (the plugin windows) as
+/// unmanaged override-redirect X11 windows, so tiling compositors like sway
+/// never see them and cannot apply rules (floating, opacity...) to them.
+/// WS_EX_APPWINDOW makes Wine hand the window to the window manager instead.
+/// Only used when HEBNIX_WINE_MANAGED is set.
+pub fn wine_manage_window(title: &str) {
+    static DONE: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+    let title = wide(title);
+    unsafe {
+        let Ok(window) = FindWindowW(None, PCWSTR(title.as_ptr())) else {
+            return;
+        };
+        if window.is_invalid() {
+            return;
+        }
+        let key = window.0 as isize;
+        let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if done.contains(&key) {
+            return;
+        }
+        let ex = GetWindowLongW(window, GWL_EXSTYLE) as u32;
+        let new = (ex | WS_EX_APPWINDOW.0) & !WS_EX_TOOLWINDOW.0;
+        if new != ex {
+            SetWindowLongW(window, GWL_EXSTYLE, new as i32);
+        }
+        // a SetWindowPos is what makes Wine re-check and switch to managed
+        let _ = SetWindowPos(
+            window,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        done.push(key);
+    }
 }
 
 pub fn foreground_window_is_ours() -> bool {

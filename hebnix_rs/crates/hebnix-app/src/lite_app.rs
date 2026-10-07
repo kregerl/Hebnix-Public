@@ -2850,6 +2850,11 @@ impl LiteApp {
         for (slug, state) in windows {
             let viewport_id = egui::ViewportId::from_hash_of(("lite_plugin_window", &slug));
             let shown = state.shown(focus_ok);
+            // linux/wine patch: let the window manager (e.g. sway) manage
+            // plugin windows so it can float them and apply opacity rules
+            if shown && std::env::var_os("HEBNIX_WINE_MANAGED").is_some() {
+                winutil::wine_manage_window(&state.title);
+            }
             let mut builder = egui::ViewportBuilder::default()
                 .with_title(state.title.clone())
                 .with_inner_size([
